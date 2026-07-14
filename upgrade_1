@@ -1,0 +1,1286 @@
+# Software Upgrade & Downgrade — Complete Guide for TM-3000
+
+Welcome to the team. This guide teaches **Software Upgrade (SWU)** and **Software Downgrade** from zero, then maps everything to your actual project at `/home/svallepalli/git/tm3000` — the **Infinera XTM / Lumentis TM-3000** OTN/DWDM platform.
+
+---
+
+# PART 1 – THEORY
+
+## 1. What is software upgrade and downgrade?
+
+**Simple explanation**
+
+A telecom network element (NE) is a box in a rack that carries customer traffic (voice, data, video over fiber). Inside it runs **embedded Linux software** — like an operating system + applications on your phone, but for industrial equipment.
+
+- **Software Upgrade** = replacing old software with a **newer** version (bug fixes, new features, security patches).
+- **Software Downgrade** = going back to an **older** version (when a new release has problems, or for testing).
+
+The software is delivered as **packages** (`.pkg` or `.rpm` files), not as a single file. Each package may contain:
+- **Bootloader** (`cuboot`, `tuboot`)
+- **Kernel** (`cukernel`, `oskernel`)
+- **Application** (`cuappl`, `tuappl`, `osappl`)
+- **Filesystem** (configuration, scripts)
+
+**Telecom term:** ENM = Element Network Manager release (e.g., R34.0.0). Upgrading the NE often means upgrading to a new ENM release.
+
+---
+
+## 2. Why do we need it?
+
+| Reason | Explanation |
+|--------|-------------|
+| **Bug fixes** | Crashes, memory leaks, wrong alarms |
+| **New features** | New line card support, higher speeds (100G, 400G OTN) |
+| **Security** | Patch vulnerabilities |
+| **Hardware compatibility** | New FPGA/firmware needs new software |
+| **Regulatory compliance** | Telecom operators require supported SW versions |
+| **Rollback** | Downgrade when upgrade fails |
+
+Telecom equipment runs **24/7**. You cannot just unplug and reinstall like a PC. SWU must be **controlled, safe, and reversible**.
+
+---
+
+## 3. What problems does it solve?
+
+| Problem | How SWU solves it |
+|---------|-------------------|
+| Manual file copying is error-prone | Automated download → install → activate flow |
+| Wrong SW on wrong hardware | HW/SW **rules** and **capabilities** block invalid combinations |
+| Service interruption | Install without reboot; activate + reboot only when ready |
+| Failed upgrade bricks the box | **Fallback** checkpoints, dual-bank flash, `prev`/`next`/`cur` links |
+| Multi-board chassis complexity | Manager (`ne_swumd`) coordinates CU + all line cards |
+| Downgrade to incompatible SW | `checkRulesAndCapability()` rejects activation |
+
+---
+
+## 4. Where is it used in telecom equipment?
+
+In TM-3000, SWU is used at these levels:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Network Element (NE) — entire chassis                  │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐     │
+│  │ CU (slot 0) │  │ Line Card 1 │  │ Line Card N │     │
+│  │ Control Unit│  │ EMXP/MXP... │  │ TU boards   │     │
+│  └─────────────┘  └─────────────┘  └─────────────┘     │
+└─────────────────────────────────────────────────────────┘
+```
+
+| Level | What gets upgraded |
+|-------|-------------------|
+| **NE (whole system)** | `swu upgrade all all enm-v2.spec` |
+| **CU only** | Boot, kernel, application on control board |
+| **TU / Line cards** | Traffic unit software per slot |
+| **OS layer** | `oskernel`, `osappl` (platform software) |
+| **FPGA / module firmware** | Separate path (e.g., NID firmware on EMXP cards) |
+
+**User interfaces in your project:**
+- CLI: `swu <command>`
+- Web UI: `swu.js` / `swu.html`
+- SNMP: via `NeSwmi_execSnmpCommand`
+
+---
+
+## 5. Which hardware components are involved?
+
+Think of the chassis as a **computer inside a metal box**:
+
+### CU (Control Unit)
+- **Role in SWU:** The **brain**. Runs `ne_swumd` (upgrade manager), CLI, management software.
+- **Receives** upgrade commands first.
+- **Distributes** packages to line cards via backplane.
+- **Stores** software in flash; coordinates reboot of entire NE.
+
+### TU (Traffic Unit)
+- **Role in SWU:** Line card that handles **traffic** (OTN/DWDM signals).
+- **Receives** software from CU (via `ne_swum_distr.c`).
+- **Runs** its own `alib_swus` (SWU server) process.
+- Has less flash/RAM than CU — packages may be segmented.
+
+### Line Cards (EMXP, MXP, FXP, etc.)
+- Physical boards plugged into slots.
+- Each has its own CPU, flash, sometimes FPGA.
+- SWU treats each slot as a **board** with boot/kernel/appl categories.
+
+### Backplane
+- Electrical bus connecting CU to all slots.
+- **Role in SWU:** Carries IPC messages and file transfer (software packages) between CU and TUs.
+- Not software — but the **physical path** for distribution.
+
+### Flash (NOR/NAND flash memory)
+- **Non-volatile storage** — keeps data when power is off.
+- Stores: bootloader, kernel images, application filesystems.
+- **Role in SWU:** Target of install/activate. Often **dual-bank** (running + standby).
+
+### RAM
+- **Volatile memory** — lost on reboot.
+- **Role in SWU:** Download buffer (`/tftpboot` on TU is often RAM-disk), unpack temp dir (`/tmp/swu_unpack`), running processes.
+
+### FPGA (Field Programmable Gate Array)
+- Reconfigurable hardware chip for fast datapath logic.
+- **Role in SWU:** FPGA **bitstreams** may be inside firmware packages; upgraded separately from main SW on some cards (`eq_emxpm_child_portdevice_fw.c`).
+
+### CPU
+- Runs Linux and all SWU processes.
+- **Role in SWU:** Executes download, verify, flash write, reboot orchestration.
+
+### EEPROM
+- Small persistent memory for board identity, serial numbers, boot config.
+- **Role in SWU:** Stores **inventory** read by `Alib_readInventory()` — used in HW/SW rules matching.
+
+### Other hardware
+| Component | SWU role |
+|-----------|----------|
+| **PRAM** (Persistent RAM) | Stores version info; detects upgrade vs downgrade boot reason |
+| **Bootloader** | Selects which flash bank/kernel to boot after activate |
+| **Network port** | TFTP/FTP/HTTP download of packages from server |
+
+---
+
+# PART 2 – REAL SYSTEM WORKING
+
+Example: operator runs:
+
+```shell
+swu download ftp://10.210.36.98/remote/RC/R34.0.0/osappl04a-r34a-1.powerpc.pkg
+swu -r upgrade all all enm-v2.spec
+```
+
+## Step-by-step inside the equipment
+
+```
+User types: swu upgrade all all enm-v2.spec
+        ↓
+```
+
+### Step 1 — CLI receives the command
+- **What happens:** Shell (`mibsh`) parses input, finds command `swu`.
+- **Module:** `mgmt_cli_bl` → `mibsh_exec_sw_upgrade()` in `mgmt_cli_swu.c`.
+- **Why:** CLI is the user-facing entry point.
+
+### Step 2 — CLI connects to SW Upgrade Manager
+- **Function:** `NeSwmi_connectWait()` → connects to process `ne_swumd`.
+- **Mechanism:** ICN/ICI (Inter-Component Notification — internal message bus).
+- **Why:** CLI does not upgrade directly; it asks the **manager**.
+
+### Step 3 — CLI sends execute request
+- **Function:** `NeSwmi_executeCommand2(swumi, 0, userName, TRUE, "upgrade all all enm-v2.spec")`
+- **Message:** `NE_SWMI_EXECUTE_COMMAND_REQ` with command string.
+- **Why:** Manager owns the full upgrade transaction.
+
+### Step 4 — Manager receives request
+- **Process:** `ne_swumd` (SW Upgrade Manager daemon).
+- **Function:** `handleManagerExecute()` → `handleManagerExecuteImpl()` in `ne_swum_mgr.c`.
+- **Checks:** Is another SWU transaction busy? (`SEM_IS_LOCKED`).
+- **Why:** Only one upgrade at a time — prevents corruption.
+
+### Step 5 — Manager forwards to slave
+- **Function:** `NeSwmi_sendExecuteReq()` → slave process `ne_swum_slave`.
+- **Why:** Manager orchestrates; slave executes the state machine.
+
+### Step 6 — Manager reads ENM spec file
+- **File:** `enm-v2.spec` (package manifest — lists versions per board/category).
+- **Function:** `readNeSwSpecFile()`, `parsePackageName()`.
+- **Why:** "upgrade all all" means every board, every category — spec defines **which version** for each.
+
+### Step 7 — Per-board task creation
+- Manager creates a **Task** per slot (subrack, slot).
+- Tracks state: downloading → installing → activating → rebooting.
+- **File:** `ne_swum.h` — `TaskS` structure.
+
+### Step 8 — Does CU know? Does TU get messages?
+- **Yes.** Manager uses:
+  - **NeSwci** — board software status subscription.
+  - **AlibSwui** — per-board install/activate RPC.
+  - **ne_swum_distr** — file distribution CU → TU.
+
+### Step 9 — CU ↔ TU communication
+- CU downloads package to `/tftpboot`.
+- `ne_swum_distr.c` **segments** large packages and sends to TU slots.
+- TU stores in `/tftpboot/swu_*` on RAM-disk.
+- **Why:** TUs may not have direct FTP access; CU is the hub.
+
+### Step 10 — Compatibility verification
+- **When:** Before activate (and during verify).
+- **Functions:** `checkRulesAndCapability()`, `AlibSwui_verifyRpmFile()`, `AlibSwui_verifyVersion()`.
+- **Files read:**
+  - `swu_sw_hw_rules.txt` — HW → required SW capability
+  - `swu_sw_*_capability.txt` — what this SW version supports
+  - Board inventory from EEPROM
+- **Downgrade block example:** Old SW lacks capability required by current HW → activation rejected.
+
+### Step 11 — Image selection
+- Spec file + board type → package name (e.g., `cuappl04a-r34a-1`).
+- Categories: `boot`, `kernel`, `appl`, `filesystem`.
+
+### Step 12 — Where is image stored?
+| Location | Purpose |
+|----------|---------|
+| `/tftpboot/` | Download staging |
+| `/tmp/swu_unpack` | RPM unpack temp |
+| Flash partitions | Permanent install target |
+| Symlink dirs | `cur`, `next`, `prev`, `exec` links |
+
+### Step 13 — Install (no reboot yet)
+- **Per board:** `installCommandImpl()` → `AlibSwui_install()` → `handleInstall()` → `doInstall()`.
+- **Steps inside `doInstall()`:**
+  1. Run **pre-install script**
+  2. `AlibSwui_downloadFile()` if remote
+  3. `unpackRpm()` — extract package to flash area
+  4. Run **post-install script**
+- **Result:** New version **installed** but **not running**.
+
+### Step 14 — Activate
+- **Function:** `doActivate()` — moves symbolic links:
+  - `next` → new version
+  - `prev` → old `next`
+  - `cur` → new version
+- **Also:** `verifyBoot()`, `verifyKernel()`, `verifyApplication()` before activate.
+- **Why:** Activate = "boot this version next time".
+
+### Step 15 — Reboot
+- **Function:** `doReboot()`, `rebootUpdatedBoards()`.
+- **Order:** Often line cards first, CU last (so CU stays up during distribution).
+- **Mechanism:** Warm-boot notifications via `alib_wb_if`; `reboot()` system call.
+
+### Step 16 — New software activated
+- Bootloader reads `next` link → loads new kernel from flash.
+- Linux starts → applications use new `cur` link.
+- **Detection:** `bootReasonSwUpgrade` or `bootReasonSwDowngrade` in `emxp2_hw_bl_sysinfo.c` by comparing current vs previous version in PRAM.
+
+### Downgrade path (not a separate `swdowngrade` command)
+- Operator uses `swu fallback` or installs older package + activate.
+- **Blocked** if `checkRulesAndCapability()` fails.
+- **Detected** at boot as `bootReasonSwDowngrade` when version numbers decrease.
+
+---
+
+# PART 3 – COMPLETE CODE FLOW (CLI)
+
+## Function call tree — `swu upgrade`
+
+```
+mibsh (CLI shell)
+    ↓
+mibsh_exec_sw_upgrade()                    [mgmt_cli_swu.c]
+    ↓
+NeSwmi_connectWait()                       [ne_swmi.c]
+    ↓
+NeSwmi_executeCommand2()                   [ne_swmi.c]
+    ↓
+NeSwmi_executeCommandAux()                 [ne_swmi.c]
+    ↓
+NeSwmi_sendExecuteReq()                    [ne_swmi.c]
+    │  Message: NE_SWMI_EXECUTE_COMMAND_REQ
+    │  IPC: ICI over ICN
+    ↓
+ne_swumd main loop                           [ne_swum_mgr.c]
+    ↓
+handleManagerExecute()                       [ne_swum_mgr.c]
+    ↓
+handleManagerExecuteImpl()                   [ne_swum_mgr.c]
+    ↓
+NeSwmi_sendExecuteReq() → ne_swum_slave    [ne_swum_slave.c]
+    ↓
+(parse "upgrade all all enm-v2.spec")
+    ↓
+readNeSwSpecFile()                           [ne_swum_utils.c]
+    ↓
+upgradeNeCommandImpl()                       [ne_swum_utils.c]
+    ↓
+connectServer() → AlibSwui_connectWait()     [alib_swui.c]
+    ↓
+upgradeCategory()                            [ne_swum_utils.c]
+    ↓
+AlibSwui_install()                           [alib_swui.c]
+    │  Message: ALIB_SWUI_INSTALL_REQ
+    ↓
+handleInstall()                              [alib_swus_main.c]
+    ↓
+doInstall()                                  [alib_swus_main.c]
+    ├── runScript()           (pre-install)
+    ├── AlibSwui_downloadFile()
+    ├── unpackRpm()
+    └── runScript()           (post-install)
+    ↓
+AlibSwui_activate()                          [alib_swui.c]
+    │  Message: ALIB_SWUI_ACTIVATE_REQ
+    ↓
+handleActivate()                             [alib_swus_main.c]
+    ↓
+activateAux()                                [alib_swus_main.c]
+    ├── verifyBoot() / verifyKernel() / verifyApplication()
+    │       └── checkRulesAndCapability()
+    └── doActivate()          (move cur/next/prev links)
+    ↓
+rebootUpdatedBoards()                        [ne_swum_utils.c]
+    ↓
+doReboot()                                   [alib_swus_main.c]
+    ↓
+Linux reboot → Bootloader → New kernel
+```
+
+## Function call tree — `swu download` only
+
+```
+mibsh_exec_sw_upgrade()
+    ↓
+NeSwmi_executeCommand2("download ftp://...")
+    ↓
+ne_swum_mgr → slave
+    ↓
+AlibSwui_downloadFileImpl()                [alib_swui_tools.c]
+    ↓
+FTI (TFTP/FTP/HTTP)                        [nlib_fti_if]
+    ↓
+File saved to /tftpboot/
+```
+
+---
+
+## Step-by-step with parameters (install path)
+
+| Step | File | Function | Input | Processing | Output | Next |
+|------|------|----------|-------|------------|--------|------|
+| 1 | `mgmt_cli_swu.c` | `mibsh_exec_sw_upgrade` | `cmdStr="swu install..."` | Parse command, skip `swu` prefix | — | `NeSwmi_connectWait` |
+| 2 | `ne_swmi.c` | `NeSwmi_executeCommand2` | ICN handle, username, cmd line | Wraps aux with confirm handling | rc | `NeSwmi_executeCommandAux` |
+| 3 | `ne_swmi.c` | `NeSwmi_sendExecuteReq` | `cmdLine`, `clientId` | Build `NeSwmi_ExecuteCommandReqS`, `Ici_send` | Message to `ne_swumd` | Wait for CFM/REJ |
+| 4 | `ne_swum_mgr.c` | `handleManagerExecuteImpl` | `msg->cmd` | Lock check, `startTransaction` | Success/Busy | Forward to slave |
+| 5 | `ne_swum_utils.c` | `installCommandImpl` | `TaskS` (slot, category) | Delegate to install aux | rc | `installAux` |
+| 6 | `alib_swui.c` | `AlibSwui_install` | category, path, host, version | Send `ALIB_SWUI_INSTALL_REQ`, wait CFM | serverId | — |
+| 7 | `alib_swus_main.c` | `handleInstall` | `AlibSwui_InstallReqS` | Send CFM immediately, then work | — | `doInstall` |
+| 8 | `alib_swus_main.c` | `doInstall` | path, address, version, category | Pre-script → download → unpack → post-script | 0/-1 | `handleInstall` complete ind |
+| 9 | `alib_swus_main.c` | `unpackRpm` | dest path, category | Extract RPM, place in flash layout | — | return |
+| 10 | `alib_swus_main.c` | `handleActivate` | category, version | Verify + activate | CFM/REJ | `activateAux` |
+
+---
+
+# PART 4 – MAIN FUNCTIONS (Top 15)
+
+## 1. `mibsh_exec_sw_upgrade`
+| Attribute | Detail |
+|-----------|--------|
+| **Purpose** | CLI entry for all `swu` commands |
+| **Why exists** | Bridge between human operator and SWU manager |
+| **Caller** | `mibsh.c` command table |
+| **Module** | `mgmt_cli_bl` |
+| **Input** | `cliStatep`, `action`, `cmdStr` |
+| **Output** | Prints result / errors to terminal |
+| **Key variables** | `swumi` (manager handle), `background` flag |
+| **Next** | `NeSwmi_connectWait`, `NeSwmi_executeCommand2` |
+
+## 2. `NeSwmi_executeCommand2`
+| Attribute | Detail |
+|-----------|--------|
+| **Purpose** | Send SWU command to manager, wait for response |
+| **Why exists** | Client API for CLI, SNMP, Web |
+| **Caller** | CLI, SNMP agent |
+| **Module** | `ne_swmi_if` |
+| **Input** | Handle, clientId, userName, isConfirmed, cmdLine |
+| **Output** | Return code; may prompt for confirm |
+| **Next** | `NeSwmi_executeCommandAux` |
+
+## 3. `handleManagerExecuteImpl`
+| Attribute | Detail |
+|-----------|--------|
+| **Purpose** | Manager-side command dispatcher |
+| **Why exists** | Serialize SWU transactions, reject if busy |
+| **Caller** | ICN message handler in `ne_swum_mgr.c` |
+| **Module** | `ne_swum_bl` |
+| **Input** | `NeSwmi_ExecuteCommandReqS` |
+| **Output** | `NeSwumExecuteResultE` (Success, Busy, etc.) |
+| **Key variables** | `self->poll`, `SEM_IS_LOCKED` |
+| **Next** | `NeSwmi_sendExecuteReq` to slave, `startTransaction` |
+
+## 4. `upgradeNeCommandImpl`
+| Attribute | Detail |
+|-----------|--------|
+| **Purpose** | Upgrade one board slot (all or one category) |
+| **Why exists** | NE manager talks to per-board SWU server |
+| **Caller** | Slave state machine, distribution |
+| **Module** | `ne_swum_bl` |
+| **Input** | `NeededVersionListS`, category, `TaskS` |
+| **Output** | `NeSwum_ErrorE` |
+| **Next** | `connectServer` → `upgradeCategory` |
+
+## 5. `installCommandImpl`
+| Attribute | Detail |
+|-----------|--------|
+| **Purpose** | Install SW package on one board |
+| **Why exists** | Separates install phase from activate |
+| **Caller** | Install state machine |
+| **Input** | `self->install.category`, version, file, `TaskS` |
+| **Next** | `installAux` → `AlibSwui_install` |
+
+## 6. `AlibSwui_install`
+| Attribute | Detail |
+|-----------|--------|
+| **Purpose** | Client RPC: request install on a board |
+| **Why exists** | Manager should not touch board flash directly |
+| **Caller** | `installAux`, `upgradeCategory` |
+| **Module** | `alib_swui_if` |
+| **Input** | category, path, hostAddress, version, optionMask |
+| **Output** | Waits for INSTALL_CFM or INSTALL_REJ |
+| **IPC** | `ALIB_SWUI_INSTALL_REQ` via ICI |
+| **Next** | Server `handleInstall` |
+
+## 7. `doInstall`
+| Attribute | Detail |
+|-----------|--------|
+| **Purpose** | Actual install work on the board |
+| **Why exists** | Core board-level install logic |
+| **Caller** | `handleInstall` |
+| **Module** | `alib_swus_bl` |
+| **Processing** | Pre-script → download → unpackRpm → post-script |
+| **Next** | Sends `INSTALL_DOWNLOADED_IND` if progress enabled |
+
+## 8. `unpackRpm`
+| Attribute | Detail |
+|-----------|--------|
+| **Purpose** | Extract `.rpm`/`.pkg` to flash staging area |
+| **Why exists** | Packages are archives, not raw binaries |
+| **Caller** | `doInstall` |
+| **Input** | dest path, category, version |
+| **Output** | Files in flash partition layout |
+
+## 9. `checkRulesAndCapability`
+| Attribute | Detail |
+|-----------|--------|
+| **Purpose** | **Block illegal downgrade/upgrade** (HW/SW mismatch) |
+| **Why exists** | Prevent activating SW that doesn't support current HW |
+| **Caller** | `verifyApplication`, `verifyBoot`, etc. |
+| **Input** | module, version, prefix path |
+| **Logic** | `Alib_mergeRules` + `Alib_readCapability` + `isVersionAllowed` |
+| **Config files** | `swu_sw_hw_rules.txt`, `swu_sw_*_capability.txt` |
+
+## 10. `AlibSwui_activate`
+| Attribute | Detail |
+|-----------|--------|
+| **Purpose** | Client RPC: activate installed version |
+| **Caller** | `activateTransaction`, `doActivate` in manager |
+| **Input** | category, version |
+| **Next** | `handleActivate` on server |
+
+## 11. `activateAux` / `doActivate`
+| Attribute | Detail |
+|-----------|--------|
+| **Purpose** | Switch running pointers to new version |
+| **Why exists** | Install ≠ run; activate updates `next`/`cur`/`prev` symlinks |
+| **`doActivate` logic** | `NlibSys_moveLink(path, NEXT_LINK, version)` etc. |
+| **No flash erase** | Mostly symlink manipulation — fast rollback possible |
+
+## 12. `verifyApplication` / `verifyBoot` / `verifyKernel`
+| Attribute | Detail |
+|-----------|--------|
+| **Purpose** | Pre-activate sanity checks |
+| **Why exists** | Catch corrupt/incomplete installs before reboot |
+| **Processing** | Directory exists, run verify script, rules check |
+
+## 13. `rebootUpdatedBoards`
+| Attribute | Detail |
+|-----------|--------|
+| **Purpose** | Reboot all boards that were activated |
+| **Why exists** | New kernel/appl only runs after reboot |
+| **Caller** | End of upgrade transaction |
+
+## 14. `fallbackCreate` / `fallbackStoreNextCheckPoint`
+| Attribute | Detail |
+|-----------|--------|
+| **Purpose** | Save rollback point before upgrade |
+| **Why exists** | `swu fallback` can restore previous ENM |
+| **Files** | `/var/log/lumentis/swu_fallback_checkpoint.txt` |
+
+## 15. `bootReasonSwUpgrade` / `bootReasonSwDowngrade` detection
+| Attribute | Detail |
+|-----------|--------|
+| **Purpose** | Classify boot after SW change |
+| **Module** | `emxp2_hw_bl_sysinfo.c` |
+| **Logic** | Compare `current` vs `previous` version in PRAM |
+| **Why exists** | Trigger upgrade-specific init (QoS, capabilities) |
+
+---
+
+## Helper function categories (summary)
+
+| Category | Examples | Role |
+|----------|----------|------|
+| **Validation** | `AlibSwui_verifyRpmFile`, `isVersionAllowed`, `verifyFwRulesAndCapability` | Reject bad packages |
+| **Logging** | `TE_TRC`, `TE_ENTER`, `cmdProgress` | Trace and operator progress |
+| **Configuration** | `readNeSwSpecFile`, `Alib_readCapability`, `readInventoryAndRules` | Read specs and rules |
+| **Database** | ENM release files, `swu_sw_status.txt`, fallback files | Persist SW state |
+| **IPC** | `Ici_send`, `Ici_malloc`, `AlibCs_recvData` | All inter-process comms |
+| **Memory Management** | `Ici_malloc`, `Ici_free`, `calloc` in tasks | Message buffers |
+| **File Handling** | `AlibSwui_downloadFile`, `NlibSys_moveLink`, `Nlib_shellCommandSafe` | Download, symlinks, scripts |
+| **Utility** | `parsePackageName`, `NeSwmi_getCommand`, `findTask` | Parsing and lookup |
+| **Error Handling** | `formatTransactionError`, `sendExecuteRej`, `AlibSwuii_sendRejectMsg` | Propagate failures to user |
+
+---
+
+# PART 5 – COMMUNICATION
+
+## Layer diagram
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Web GUI    │     │     CLI      │     │    SNMP      │
+│   swu.js     │     │  mibsh/swu  │     │  ne_swmi     │
+└──────┬───────┘     └──────┬───────┘     └──────┬───────┘
+       │                    │                    │
+       └────────────────────┼────────────────────┘
+                            │ NeSwmi (ICI/ICN)
+                            ▼
+              ┌─────────────────────────┐
+              │   ne_swumd (Manager)    │
+              │   ne_swum_mgr.c         │
+              └─────────┬───────────────┘
+                        │ NeSwmi internal
+                        ▼
+              ┌─────────────────────────┐
+              │   ne_swum_slave         │
+              │   ne_swum_utils.c       │
+              └─────────┬───────────────┘
+                        │ AlibSwui + NeSwci
+          ┌─────────────┼─────────────┐
+          ▼             ▼             ▼
+    ┌──────────┐  ┌──────────┐  ┌──────────┐
+    │ alib_swus│  │ne_swum_  │  │ alib_swus│
+    │  (CU)    │  │  distr   │  │  (TU)    │
+    └────┬─────┘  └────┬─────┘  └────┬─────┘
+         │             │             │
+         └─────────────┼─────────────┘
+                       ▼
+              ┌─────────────────────────┐
+              │   Linux OS / Kernel     │
+              │   VFS, flash drivers    │
+              └─────────┬───────────────┘
+                        ▼
+              ┌─────────────────────────┐
+              │   Hardware              │
+              │ Flash, CPU, EEPROM, FPGA  │
+              └─────────────────────────┘
+```
+
+## Sequence diagram — CLI upgrade one board
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant CLI as mgmt_cli_swu
+    participant SWMI as ne_swmi
+    participant MGR as ne_swumd
+    participant SLV as ne_swum_slave
+    participant SWUI as alib_swui
+    participant SWUS as alib_swus
+    participant OS as Linux
+
+    User->>CLI: swu upgrade 1 3 appl r34.spec
+    CLI->>SWMI: NeSwmi_connectWait()
+    SWMI->>MGR: ICI connect (NeSwmi service)
+    CLI->>SWMI: NeSwmi_executeCommand2(cmd)
+    SWMI->>MGR: NE_SWMI_EXECUTE_COMMAND_REQ
+    MGR->>MGR: handleManagerExecuteImpl (lock, startTransaction)
+    MGR->>SLV: forward execute req
+    SLV->>SLV: readNeSwSpecFile, create Task
+    SLV->>SWUI: AlibSwui_install(slot 3)
+    SWUI->>SWUS: ALIB_SWUI_INSTALL_REQ
+    SWUS->>SWUS: doInstall (download, unpackRpm)
+    SWUS-->>SWUI: ALIB_SWUI_INSTALL_CFM
+    SLV->>SWUI: AlibSwui_activate()
+    SWUI->>SWUS: ALIB_SWUI_ACTIVATE_REQ
+    SWUS->>SWUS: verifyApplication, checkRulesAndCapability
+    SWUS->>OS: NlibSys_moveLink (next/cur)
+    SWUS-->>SWUI: ALIB_SWUI_ACTIVATE_CFM
+    SLV->>SWUS: reboot request
+    SWUS->>OS: reboot()
+    OS-->>User: board comes up with new SW
+```
+
+## CU ↔ TU communication
+
+```mermaid
+sequenceDiagram
+    participant CU_MGR as ne_swumd (CU)
+    participant DISTR as ne_swumd_distr
+    participant SWCI as ne_swci
+    participant TU_MGR as alib_swus (TU)
+    participant TU_RAM as /tftpboot (TU)
+
+    CU_MGR->>DISTR: distribute package to slot N
+    DISTR->>SWCI: NeSwci file distribution msgs
+    DISTR->>TU_RAM: segmented swu_* files via backplane
+    CU_MGR->>TU_MGR: AlibSwui_install (host=CU address)
+    TU_MGR->>TU_RAM: read local /tftpboot/swu_*
+    TU_MGR->>TU_MGR: unpackRpm → flash
+```
+
+## IPC mechanisms in your project
+
+| Mechanism | Used for |
+|-----------|----------|
+| **ICI/ICN** | All internal RPC (`Ici_send`, `AlibCs_recvData`) |
+| **Messages** | `NE_SWMI_EXECUTE_COMMAND_REQ`, `ALIB_SWUI_INSTALL_REQ`, etc. |
+| **Events/Indications** | `ALIB_SWUI_INSTALL_DOWNLOADED_IND`, progress indications |
+| **Sockets** | FTI download (TFTP/FTP/HTTP to external server) |
+| **Shared memory** | Board resource handles (`EqRhi_connectShm`) |
+| **Config database** | Files under `/etc/lumentis/`, `/var/log/lumentis/` |
+| **Driver interface** | Flash write via kernel MTD/block drivers; FPGA via custom drivers |
+| **Interrupts** | Not primary in SWU path; used in low-level HW |
+
+---
+
+# PART 6 – OPERATING SYSTEM
+
+Embedded Linux on PowerPC (and x86 for sim) runs the entire SWU stack.
+
+| OS concept | Role in SWU |
+|------------|-------------|
+| **Process creation** | `ne_swumd`, `ne_swum_slave`, `alib_swus` started at boot via `ne_swum_monolite.c` |
+| **Threads** | Manager uses ICN event loop; blocking waits in `AlibCs_recvData` with timeout |
+| **Scheduler** | Download/install run as normal processes; long operations yield via IPC |
+| **File system** | ext2/squashfs on flash; symlinks for `cur`/`next`/`prev` version switching |
+| **Flash access** | Kernel MTD driver; `unpackRpm` writes through VFS; raw flash for boot sectors |
+| **Memory allocation** | `Ici_malloc` for messages; `/tftpboot` on TU RAM-disk for downloads |
+| **Device drivers** | Network (download), MTD/flash, EEPROM (inventory), FPGA programmers |
+| **Kernel interaction** | `reboot()` syscall, `stat()`, `readlink()`, module loading on new kernel boot |
+| **Signals** | Processes may handle SIGTERM on shutdown before upgrade reboot |
+| **Timers** | IPC timeouts (e.g., 240s for execute command), download timeouts |
+| **Logging** | `TE_TRC` → trace files; `/var/log/lumentis/swu_history.txt` |
+| **Bootloader** | U-Boot or similar — reads `next` bank, loads kernel into RAM |
+| **Reboot** | `doReboot()` → sync filesystems → `reboot(RB_AUTOBOOT)` → bootloader picks new image |
+
+**Activate without immediate flash erase:** Most SWU "activation" is **symlink updates** in the filesystem — the OS and bootloader cooperate. True flash programming happens during **install/unpack**.
+
+---
+
+# PART 7 – PROJECT IMPLEMENTATION (TM-3000)
+
+## Module map
+
+| Module | Path | Responsibility |
+|--------|------|----------------|
+| **mgmt_cli_bl** | `ne/mgmt_ss/mgmt_cli_bl/` | CLI `swu` command |
+| **ne_swmi_if** | `ne/ne_swmi_if/` | Manager client API (CLI/SNMP/GUI) |
+| **ne_swum_bl** | `ne/ne_ss/ne_swum_bl/` | NE-wide upgrade orchestration |
+| **alib_swui_if** | `ne/alib_swui_if/` | Per-board SWU client API |
+| **alib_swus_bl** | `ne/alib_ss/alib_swus_bl/` | Per-board SWU server (install/activate) |
+| **alib_swuc_bl** | `ne/alib_ss/alib_swuc_bl/` | SWU client utility process |
+| **ne_swci_if** | `ne/ne_swci_if/` | Board SW status & file distribution |
+| **webapp** | `webapp/js/main/swu.js` | Web UI |
+| **eq_emxpm_bl** | Port-device firmware upgrade on line cards |
+| **emxp2_hw_bl** | Boot reason detection (upgrade/downgrade) |
+
+## Key source files
+
+| File | What it does |
+|------|--------------|
+| `mgmt_cli_swu.c` | CLI entry — `mibsh_exec_sw_upgrade` |
+| `mibsh.c` | Registers `{"swu", mibsh_exec_sw_upgrade, ...}` |
+| `ne_swmi.c` | Client library — connect, execute, poll status |
+| `ne_swum_mgr.c` | Manager daemon main loop, `handleManagerExecute` |
+| `ne_swum_slave.c` | Slave state machine, install ready/failed handlers |
+| `ne_swum_utils.c` | Core logic: `upgradeNeCommandImpl`, `installCommandImpl`, `activateTransaction` |
+| `ne_swum_distr.c` | CU→TU package distribution |
+| `ne_swum_fallback.c` | Rollback checkpoints |
+| `alib_swui.c` | Board client: install, activate, delete, rollback |
+| `alib_swui_tools.c` | `AlibSwui_verifyRpmFile`, download helpers |
+| `alib_swus_main.c` | Board server: `doInstall`, `doActivate`, `checkRulesAndCapability` |
+| `alib_swus_rules.c` | Parse HW/SW rules and capabilities |
+| `ne_swum_ext.h` | Runtime paths: `/etc/lumentis/swu_current_enm_release.txt` |
+
+## Package types (from `alib_swui.h`)
+
+```
+cuboot, tuboot    → Bootloader
+cukernel, oskernel → Linux kernel
+cuappl, tuappl, osappl → Applications
+filesystem        → Config/data partition
+```
+
+## Configuration flow
+
+```
+Build time (in RPM):
+  etc/swu_sw_hw_rules.txt
+  etc/swu_sw_<platform>_capability.txt
+        ↓ packaged into .rpm/.pkg
+Install time:
+  unpacked to board flash prefix
+        ↓
+Activate time:
+  checkRulesAndCapability() reads inventory + rules + capability
+        ↓
+Runtime state:
+  /etc/lumentis/swu_current_enm_release.txt      (target ENM)
+  /etc/lumentis/swu_current_enm_release.running.txt (actually running)
+  /var/log/lumentis/swu_sw_status.txt           (per-board status)
+  /var/log/lumentis/swu_history.txt               (audit log)
+```
+
+## Data flow
+
+```
+External FTP/TFTP server
+        ↓ (FTI download)
+/tftpboot/<package>.pkg          [CU staging]
+        ↓ (ne_swum_distr, if TU)
+/tftpboot/swu_*                   [TU staging]
+        ↓ (unpackRpm)
+Flash: /path/<version>/           [installed bits]
+        ↓ (doActivate)
+Symlinks: next → r34a, cur → r34a
+        ↓ (reboot)
+Bootloader loads kernel from new bank
+        ↓
+PRAM updated: current vs previous version
+        ↓
+bootReasonSwUpgrade or bootReasonSwDowngrade
+```
+
+## Control flow (transaction states)
+
+From `ne_swmi.h` — `NeSwmi_OperationStateE`:
+
+```
+Idle → Downloading → Installing → Preparing → Activating → Rebooting → Idle
+```
+
+Manager enforces **one transaction at a time** via semaphore (`SEM_IS_LOCKED`).
+
+## CLI commands available
+
+```
+state, download, install, upgrade, activate, reboot, delete, show,
+diskusage, clean, accept, revert, exec, unlock, sparepart,
+fallback, factoryreset, help
+```
+
+## Why each major component exists
+
+| Component | Why it exists |
+|-----------|---------------|
+| **CLI layer** | Human operators need a shell interface |
+| **NeSwmi** | Decouple UI from manager; shared by CLI/SNMP/Web |
+| **ne_swumd** | One brain for whole chassis — knows all slots |
+| **ne_swum_slave** | Heavy work without blocking manager ICN loop |
+| **ne_swum_distr** | TUs can't always download directly |
+| **alib_swus per board** | Only local process should write local flash |
+| **alib_swui** | Typed RPC API instead of raw messages everywhere |
+| **Rules/capability** | Telecom safety — no silent bricking from wrong SW |
+| **Fallback** | Operations requirement: must rollback failed upgrades |
+
+---
+
+# Quick reference — First week on the team
+
+1. **Read** `Documentation/swu/swu.md` for download URL examples.
+2. **Trace** one command: set breakpoint at `mibsh_exec_sw_upgrade`, follow to `doInstall`.
+3. **Understand** install vs activate vs reboot — three separate steps.
+4. **Downgrade** = older version + rules check + `bootReasonSwDowngrade` — not a separate module.
+5. **Never skip** `checkRulesAndCapability` when debugging "activate failed" issues.
+
+---
+
+If you want to go deeper next, I can walk through one specific command (`swu install` vs `swu upgrade` vs `swu fallback`) line-by-line in the source, or draw the state machine inside `ne_swum_slave.c` step by step.
+# Software Downgrade: Fallback, Revert, and Rollback
+
+In TM-3000 there is **no** `swu downgrade` command. Downgrade is handled through three different mechanisms, each for a different situation. This is a common source of confusion for new engineers.
+
+---
+
+## First: understand the version pointers
+
+Every board stores software in flash, but **which version runs** is controlled by symbolic links:
+
+```
+Flash directories:
+  /sw/appl/
+    ├── r33a/          ← old version (still installed)
+    ├── r34a/          ← new version (installed)
+    ├── executing  → r34a   (what is RUNNING right now)
+    ├── next       → r34a   (what will boot after reboot)
+    └── previous   → r33a   (what ran before last activate)
+```
+
+| Link | Meaning |
+|------|---------|
+| **executing** | Software currently running in RAM |
+| **next** | Software that will start after reboot |
+| **previous** | Software that ran before the last activate |
+| **cur** | Board-local "current" pointer (used by `doActivate`) |
+
+**Upgrade** = install new version + move `next` to new version + reboot.
+
+**Downgrade** = move `next` (and `cur`) back to an **older installed version** + reboot.
+
+The old version must still be on flash. If someone ran `swu clean` or `swu delete`, downgrade may fail.
+
+---
+
+## Three downgrade mechanisms — when to use which
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    DOWNGRADE MECHANISMS                         │
+├─────────────┬──────────────────┬────────────────────────────────┤
+│  REVERT     │  FALLBACK        │  MANUAL (install + activate)   │
+├─────────────┼──────────────────┼────────────────────────────────┤
+│ Undo last   │ Full NE rollback │ Install older .pkg from server │
+│ activation  │ to previous ENM  │ and activate if rules allow    │
+├─────────────┼──────────────────┼────────────────────────────────┤
+│ Per board   │ All boards       │ Per board / category           │
+│ Per category│ Whole chassis    │                                │
+├─────────────┼──────────────────┼────────────────────────────────┤
+│ Before/after│ After failed     │ Lab testing, specific rollback │
+│ reboot      │ `upgrade all all`│ needs                          │
+└─────────────┴──────────────────┴────────────────────────────────┘
+```
+
+---
+
+# 1. REVERT — "Undo activation"
+
+## What it is (simple)
+
+You activated new software but want to **cancel** that decision. Revert sets `next` back to whatever is **currently executing** (running).
+
+Example:
+- Running: `r33a`
+- You activated `r34a` → `next` = `r34a` (not rebooted yet)
+- `swu revert appl all` → `next` goes back to `r33a`
+
+**Revert does NOT:**
+- Delete installed software
+- Roll back an entire ENM release across all boards
+- Download anything from a server
+
+## CLI command
+
+```shell
+swu revert <cat> <slot-expr>
+
+# Examples:
+swu revert appl all          # revert application on all boards
+swu revert all cu            # revert all categories on CU
+swu -r revert boot 1.3       # revert + reboot slot 1.3
+swu -p revert kernel tu      # prepare only (show what would happen)
+swu -f revert appl all       # force (skip some checks)
+```
+
+## What happens inside the box
+
+```
+User: swu revert appl all
+        ↓
+mibsh_exec_sw_upgrade()
+        ↓
+NeSwmi_executeCommand2("revert appl all")
+        ↓
+ne_swum_slave → revertCommand()          [ne_swum_mgrslave_utils.c]
+        ↓
+For each board (Task):
+    revertCommandImpl()
+        ↓
+    connectServer() → AlibSwui on that board
+        ↓
+    revertCategory() for each category
+        ↓
+    AlibSwui_showInstalled()  — read executing vs next
+        ↓
+    If next == executing → nothing to do
+    If next != executing → needs revert
+        ↓
+    doActivateAux(swui, cat, started_version)  — activate the EXECUTING version
+        ↓
+    (optional) reboot with -r flag
+```
+
+## Key logic in `revertCategory()`
+
+```863:925:git/tm3000/ne/ne_ss/ne_swum_bl/ne_swum_mgrslave_utils.c
+static int
+revertCategory(SelfS              *self,
+               AlibSwui_Handle    swui,
+               AlibSwui_CategoryE cat,
+               BooleanE           doIt,
+               TaskS              *task)
+{
+    // ...
+    cfm = AlibSwui_showInstalled(swui, 0, cat, 0, NULL);
+
+    if (cfm->next == cfm->started) { // No action — already aligned
+        update = 0;
+        goto clean;
+    }
+
+    // Reject if version is "only running" (not installed for next boot)
+    if (cfm->data[i].status == AlibSwui_vsOnlyRunning) {
+        // "Can not revert"
+    }
+
+    started = cfm->data[cfm->started].version;  // executing version
+
+    if (doIt) {
+        doActivateAux(self, swui, cat, started, task);  // next → executing
+    }
+    // ...
+}
+```
+
+## When to use revert
+
+| Scenario | Use revert? |
+|----------|-------------|
+| Activated wrong version, haven't rebooted | Yes |
+| Rebooted and new SW is running | No — use **fallback** or manual install |
+| Only one board wrong | Yes — `swu revert appl 1.5` |
+| Whole NE upgrade failed after reboot | No — use **fallback** |
+
+---
+
+# 2. FALLBACK — Full NE downgrade to previous release
+
+## What it is (simple)
+
+Fallback is the **safety net** for `swu upgrade all all`. Before upgrading the entire chassis, the system saves a **checkpoint** — a snapshot of every board's executing software version. If the upgrade goes wrong, you run:
+
+```shell
+swu -r fallback all all
+```
+
+That activates the **old versions recorded in the checkpoint** on all boards and restores the previous ENM release configuration.
+
+Think of it as: **"Put the whole node back to how it was before the last full upgrade."**
+
+## When is the checkpoint created?
+
+Only during **`swu upgrade all all`** (full NE upgrade):
+
+```
+swu upgrade all all enm-r34.spec
+        ↓
+fallbackHandleCheckPointAtUpgrade()     [ne_swum_fallback.c]
+        ↓
+fallbackBuildNextCheckPoint()
+  - Reads executing SW on every board (boot/kernel/appl)
+  - Records: from ENM r33 → to ENM r34
+        ↓
+(upgrade proceeds...)
+        ↓
+On success:
+fallbackStoreNextCheckPoint()
+  - Writes checkpoint to disk
+  - Copies ENM spec: running → fallback file
+```
+
+**Checkpoint is deleted if:**
+- You run a partial upgrade (`swu upgrade appl cu`, `swu upgrade all tu`)
+- You run `swu clean` / `swu delete` and remove the old SW versions
+- A new full upgrade replaces it with a new checkpoint
+
+## Files on disk
+
+| File | Path | Contents |
+|------|------|----------|
+| Checkpoint | `/var/log/lumentis/swu_fallback_checkpoint.txt` | Per-board executing versions before upgrade |
+| ENM backup | `/var/log/lumentis/swu_fallback_enm_release.txt` | Previous ENM spec file |
+| Running ENM | `/etc/lumentis/swu_current_enm_release.running.txt` | Currently running ENM |
+| Target ENM | `/etc/lumentis/swu_current_enm_release.txt` | Target ENM after upgrade |
+
+## Fallback command flow
+
+```
+User: swu -r fallback all all
+        ↓
+fallbackCommand()                        [ne_swum_mgrslave_utils.c]
+        ↓
+1. fallbackReadCurrentCheckPoint()
+   Read /var/log/lumentis/swu_fallback_checkpoint.txt
+        ↓
+2. fallbackValidateCurrentCheckPoint()
+   - Fallback ENM spec matches checkpoint "from" version
+   - Running ENM matches checkpoint "to" version
+   (If mismatch → asks user to confirm)
+        ↓
+3. self->upgradeMode = upgradeFallback
+        ↓
+4. computeNeededUpgrades()
+   For each board: getWantedVersionTask()
+     → getFallbackVersionTask()  (reads version from checkpoint)
+   Check if old SW is still installed on flash
+        ↓
+5. If old SW missing → ERROR:
+   "Additional SW must be installed from external server"
+        ↓
+6. replaceWithWanted()
+   → install if needed → activate old versions → reboot
+        ↓
+7. commitCheckPointAndEnmRelease()
+   Restore ENM spec from swu_fallback_enm_release.txt
+        ↓
+8. fallbackDeleteCurrentCheckPoint()
+   Checkpoint consumed (one-time use)
+```
+
+## Key code — reading wanted version during fallback
+
+```3370:3372:git/tm3000/ne/ne_ss/ne_swum_bl/ne_swum_utils.c
+    else if (self->upgradeMode == upgradeFallback) {
+        version = getFallbackVersionTask(self, task, cat);
+    }
+```
+
+`getFallbackVersionTask()` looks up the board's slot in the checkpoint and returns the version that was executing **before** the upgrade.
+
+## Restoring ENM release on fallback
+
+```5828:5853:git/tm3000/ne/ne_ss/ne_swum_bl/ne_swum_utils.c
+    else if (self->upgradeMode == upgradeFallback) { // Restore prev ENM?
+        fallbackFetchCurrentCheckPointInfo(..., &fromEnmVersion, ...);
+        readNeSwSpecFile(self, &spec, ENM_FALLBACK_RELEASE_FILE);
+        if (strcmp(spec.enmVersion, fromEnmVersion) == 0) {
+            cp ENM_FALLBACK_RELEASE_FILE → ENM_RELEASE_FILE
+        }
+    }
+```
+
+## Important warnings (from project help text)
+
+- Checkpoint is created **only** at `swu upgrade all all`
+- Partial upgrades **delete** the checkpoint
+- `swu clean` / `swu delete` can remove the old SW — fallback will then fail
+- **No guarantee** of success if old versions were cleaned from flash
+
+## Sequence diagram — full fallback
+
+```mermaid
+sequenceDiagram
+    participant Op as Operator
+    participant MGR as ne_swumd
+    participant FB as ne_swum_fallback
+    participant BRD as alib_swus (per board)
+    participant Disk as /var/log/lumentis
+
+  Note over Op,Disk: BEFORE: swu upgrade all all
+    MGR->>FB: fallbackBuildNextCheckPoint()
+    FB->>BRD: get executing versions (all boards)
+    FB->>Disk: store swu_fallback_checkpoint.txt
+    FB->>Disk: copy ENM spec to swu_fallback_enm_release.txt
+    MGR->>BRD: upgrade to r34...
+
+  Note over Op,Disk: AFTER: upgrade failed, operator runs fallback
+    Op->>MGR: swu -r fallback all all
+    MGR->>Disk: read checkpoint
+    MGR->>MGR: validate checkpoint vs running ENM
+    MGR->>BRD: activate r33 versions from checkpoint
+    MGR->>Disk: restore ENM spec from fallback file
+    MGR->>BRD: reboot all boards
+    BRD-->>Op: NE running previous release
+```
+
+---
+
+# 3. ROLLBACK — Board-level pointer fix
+
+## What it is
+
+`rollback` is a **lower-level board API**, not a top-level CLI command like `swu fallback`.
+
+- **Client:** `AlibSwui_rollback()` in `alib_swui.c`
+- **Server:** `handleRollback()` → `doRollback()` in `alib_swus_main.c`
+
+## What `doRollback()` does
+
+```2827:2905:git/tm3000/ne/alib_ss/alib_swus_bl/alib_swus_main.c
+doRollback(SelfS *self, char *path)
+{
+    // Read what 'cur' (current) points to
+    NlibSys_readLink(path, CUR_LINK, curLink, ...);
+
+    // Verify that directory exists in flash
+
+    // Move 'next' to point to same as 'cur'
+    NlibSys_moveLink(path, NEXT_LINK, curLink);
+}
+```
+
+**Rollback** = set `next` = `cur` (cancel a pending activation at board level).
+
+## Revert vs Rollback
+
+| | **Revert** | **Rollback** |
+|---|-----------|-------------|
+| **Scope** | NE manager command (`swu revert`) | Per-board RPC (`AlibSwui_rollback`) |
+| **Logic** | `next` → **executing** version | `next` → **cur** link |
+| **Who calls** | Operator via CLI | Internal SWU code / other modules |
+| **Categories** | boot, kernel, appl, fs | Single category per call |
+
+Revert is the **operator-facing** wrapper. Rollback is the **board server primitive**.
+
+---
+
+# 4. MANUAL DOWNGRADE (install older package)
+
+If fallback checkpoint is gone, or you need a specific older version:
+
+```shell
+# 1. Download older package
+swu download ftp://server/old/osappl04a-r33a-1.powerpc.pkg
+
+# 2. Install it
+swu install appl all localhost /tftpboot/osappl04a-r33a-1.powerpc.pkg r33a
+
+# 3. Activate it
+swu -r activate appl all r33a
+```
+
+**Blocked by rules:** `checkRulesAndCapability()` may reject activation if:
+- New HW requires newer SW capability
+- Old SW lacks a capability required by your board revision
+
+Example from `etc/README_swu_sw_rules.txt`:
+> Prevents downgrading SW on tpQmri to 5.0 or older when HW requires 11.0+.
+
+---
+
+# 5. How the system knows it was a downgrade (boot reason)
+
+After reboot, hardware layer compares versions in **PRAM** (persistent RAM):
+
+```383:417:git/tm3000/ne/emxp2_ss/emxp2_hw_bl/emxp2_hw_bl_sysinfo.c
+    if (current.versionMajor > previous.versionMajor) {
+        *reason = bootReasonSwUpgrade;
+    }
+    else if (current.versionMajor < previous.versionMajor) {
+        *reason = bootReasonSwDowngrade;
+    }
+    // ... minor/revision comparisons ...
+    else if (current.patchLevel < previous.patchLevel) {
+        *reason = bootReasonSwDowngrade;
+    }
+```
+
+Board init code (`emxp2_hw_bl.c`) uses this to run downgrade-specific setup (QoS, capabilities, etc.).
+
+---
+
+# Comparison table — all downgrade paths
+
+| Feature | Revert | Fallback | Rollback | Manual install+activate |
+|---------|--------|----------|----------|-------------------------|
+| **CLI** | `swu revert` | `swu fallback` | No direct CLI | `swu install` + `swu activate` |
+| **Scope** | Board/category | Entire NE | Single board/category | Flexible |
+| **Needs checkpoint** | No | Yes | No | No |
+| **Needs old SW on flash** | Yes (executing) | Yes (checkpoint versions) | Yes (cur) | No (re-download) |
+| **Restores ENM spec** | Partial (all boards only) | Yes | No | Manual |
+| **Typical use** | Cancel pending activate | Failed full upgrade | Internal recovery | Lab / specific version |
+
+---
+
+# Function call trees
+
+## Revert
+
+```
+mibsh_exec_sw_upgrade("revert appl all")
+    ↓
+NeSwmi_executeCommand2()
+    ↓
+revertCommand()                    [ne_swum_mgrslave_utils.c]
+    ↓
+revertCommandImpl()                (per board)
+    ↓
+revertCategory()                   (per category)
+    ↓
+AlibSwui_showInstalled()           — read executing vs next
+    ↓
+doActivateAux(executing_version)   — point next back to running SW
+    ↓
+activateUpdatedBoards()            (if -r flag)
+    ↓
+rebootUpdatedBoards()
+```
+
+## Fallback
+
+```
+mibsh_exec_sw_upgrade("fallback all all")
+    ↓
+NeSwmi_executeCommand2()
+    ↓
+fallbackCommand()                  [ne_swum_mgrslave_utils.c]
+    ↓
+fallbackReadCurrentCheckPoint()    [ne_swum_fallback.c]
+    ↓
+fallbackValidateCurrentCheckPoint()
+    ↓
+computeNeededUpgrades()
+    └── getWantedVersionTask()
+            └── getFallbackVersionTask()
+    ↓
+replaceWithWanted()
+    └── replaceSwCat() → activate old versions
+    ↓
+commitCheckPointAndEnmRelease()    — restore ENM spec
+    ↓
+rebootUpdatedBoards()
+```
+
+---
+
+# Practical scenarios for a fresher
+
+### Scenario A: "I activated r34a but haven't rebooted yet"
+```shell
+swu revert all all
+# or with reboot:
+swu -r revert all all
+```
+
+### Scenario B: "Full NE upgrade to r34 failed, node is unstable"
+```shell
+swu show release                    # check current ENM
+swu show executing                  # see what's running
+swu -r fallback all all             # rollback entire NE
+```
+
+### Scenario C: "Fallback says old SW must be installed from server"
+The checkpoint exists but `swu clean` removed old versions from flash:
+```shell
+# Re-download and install the versions shown in "Needs upgrading to ..."
+swu download ftp://server/.../cuappl04a-r33a-1.powerpc.pkg
+swu install appl all localhost /tftpboot/... r33a
+swu -r fallback all all
+```
+
+### Scenario D: "I want to go from r34 to r32 in the lab"
+```shell
+swu download ftp://server/.../enm-r32.spec
+swu download ftp://server/.../osappl04a-r32a-1.powerpc.pkg
+swu -r upgrade all all enm-r32.spec
+# If rules block it, you'll see checkRulesAndCapability error
+```
+
+---
+
+# Key source files for downgrade
+
+| File | Role |
+|------|------|
+| `ne_swum_fallback.c` | Checkpoint create/read/validate/store |
+| `ne_swum_mgrslave_utils.c` | `revertCommand()`, `fallbackCommand()` |
+| `ne_swum_utils.c` | `getFallbackVersionTask()`, `commitCheckPointAndEnmRelease()` |
+| `alib_swus_main.c` | `doRollback()`, `doActivate()` |
+| `alib_swui.c` | `AlibSwui_rollback()`, `AlibSwui_showInstalled()` |
+| `alib_swus_rules.c` | Blocks illegal downgrades |
+| `emxp2_hw_bl_sysinfo.c` | `bootReasonSwDowngrade` detection |
+
+---
+
+**One-line summary:**
+- **Revert** = undo a pending activation (`next` → executing).
+- **Fallback** = undo a full NE upgrade using a saved checkpoint.
+- **Rollback** = low-level board API (`next` → `cur`).
+- **Manual downgrade** = install + activate older package (if rules allow).
+
+If you want next, I can trace one command end-to-end in the source — for example `swu -r fallback all all` with exact message IDs and file contents at each step.
